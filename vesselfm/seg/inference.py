@@ -1,5 +1,6 @@
 """ Script to perform inference with vesselFM."""
-
+import os
+import sys
 import logging
 import warnings
 from pathlib import Path
@@ -8,7 +9,6 @@ import torch
 import torch.nn.functional as F
 import hydra
 import numpy as np
-from tqdm import tqdm
 from huggingface_hub import hf_hub_download
 from monai.inferers import SlidingWindowInfererAdapt
 from skimage.morphology import remove_small_objects
@@ -18,6 +18,13 @@ from vesselfm.seg.utils.data import generate_transforms
 from vesselfm.seg.utils.io import determine_reader_writer
 from vesselfm.seg.utils.evaluation import Evaluator, calculate_mean_metrics
 
+from custom_array import Array
+
+path = os.path.join(os.path.expanduser("~"), "code", "ClearMap3")
+sys.path.insert(0, path)
+import ClearMap.ParallelProcessing.BlockProcessing as blkp
+import ClearMap.ParallelProcessing.DataProcessing.ArrayProcessing as array_processing
+import ClearMap.IO.IO as cm_io
 
 warnings.filterwarnings("ignore")
 logger = logging.getLogger(__name__)
@@ -87,8 +94,6 @@ def main(cfg):
     logger.info(f"Found {len(image_paths)} images in {cfg.image_path}.")
 
     file_ending = (cfg.image_file_ending if cfg.image_file_ending else image_paths[0].suffix)
-    image_reader_writer = determine_reader_writer(file_ending)()
-    save_writer = determine_reader_writer(file_ending)()
 
     # init sliding window inferer
     logger.debug(f"Sliding window patch size: {cfg.patch_size}")
@@ -96,62 +101,85 @@ def main(cfg):
     logger.debug(f"Sliding window overlap: {cfg.overlap}.")
     inferer = SlidingWindowInfererAdapt(
         roi_size=cfg.patch_size, sw_batch_size=cfg.batch_size, overlap=cfg.overlap, 
-        mode=cfg.mode, sigma_scale=cfg.sigma_scale, padding_mode=cfg.padding_mode
+        mode=cfg.mode, sigma_scale=cfg.sigma_scale, padding_mode=cfg.padding_mode,
+        sw_device='cuda', device='cpu', progress=True
     )
 
     # loop over images
-    metrics_dict = {}
     with torch.no_grad():
-        for idx, image_path in tqdm(enumerate(image_paths), total=len(image_paths), desc="Processing images."):
-            preds = [] # average over test time augmentations
-            for scale in cfg.tta.scales:
-                # apply pre-processing transforms
-                image = transforms(image_reader_writer.read_images(image_path)[0].astype(np.float32))[None].to(device)
-                mask = torch.tensor(image_reader_writer.read_images(mask_paths[idx])[0]).bool() if mask_paths else None
-  
-                # apply test time augmentation
-                if cfg.tta.invert:
-                    image = 1 - image if image.mean() > cfg.tta.invert_mean_thresh else image
-                    
-                if cfg.tta.equalize_hist:
-                    image_np = image.cpu().squeeze().numpy()
-                    image_equal_hist_np = equalize_hist(image_np, nbins=cfg.tta.hist_bins)
-                    image = torch.from_numpy(image_equal_hist_np).to(image.device)[None][None]
+        # TODO
+        image_paths = [Path("/network/iss/renier/projects/vasculature/pregnancy/raw_buffer/250415_multipares_primipares_virgin_idisco/250415-3/3_arteries_stitched.npy")]
+        for idx, image_path in enumerate(image_paths):
+            array = Array(image_path)
+            source = cm_io.as_source(array.source)
+            original_shape = source.shape
+            logger.info(f'Processing {array.source.name} of shape: {original_shape}')
 
-                original_shape = image.shape
-                image = resample(image, factor=scale)
-                logits = inferer(image, model)
-                logits = resample(logits, target_shape=original_shape)
-                preds.append(logits.cpu().squeeze())
+            sink, sink_shape = array_processing.initialize_sink(sink=output_folder /
+                                                                f"{image_path.name.split('.')[0]}_{cfg.file_app}.npy",
+                                                                shape=original_shape, dtype=np.uint8,
+                                                                return_buffer=False, return_shape=True)
+            patch_to_block_ratio = cfg.blocking.patch_to_block_ratio
+            block_size = patch_to_block_ratio*cfg.patch_size[0]
 
-            # merging
-            if cfg.merging.max:
-                pred = torch.stack(preds).max(dim=0)[0].sigmoid()
-            else:
-                pred = torch.stack(preds).mean(dim=0).sigmoid()
-            pred_thresh = (pred > cfg.merging.threshold).numpy()
+            logger.info(f'Splitting in blocks...')
+            blocks = blkp.split_into_blocks(source, processes=16,
+                                            axes=cfg.blocking.axes,
+                                            size_max=block_size, size_min=block_size,
+                                            overlap=cfg.blocking.overlap)
+            logger.info(f'Splitted. Starting prediction.')
+            for i, block in enumerate(blocks):
+                image = transforms(block.array)[None]
+                image = image.to(dtype=torch.float32)
+                block_shape = image.shape
+                logger.info(f"Block {i}/{len(blocks)} - {image.shape}")
+                preds = []  # average over test time augmentations
 
-            # post-processing
-            if cfg.post.apply:
-                pred_thresh = remove_small_objects(
-                    pred_thresh, min_size=cfg.post.small_objects_min_size, connectivity=cfg.post.small_objects_connectivity
-                )
+                for scale in cfg.tta.scales:
+                    # apply test time augmentation
+                    if cfg.tta.invert:
+                        image = 1 - image if image.mean() > cfg.tta.invert_mean_thresh else image
 
-            # save final pred
-            save_writer.write_seg(
-                pred_thresh.astype(np.uint8), output_folder / f"{image_path.name.split('.')[0]}_{cfg.file_app}pred.{file_ending}"
-            )
+                    # WARNING not tested yet. could cause issues
+                    if cfg.tta.equalize_hist:
+                        image_np = image.cpu().squeeze().numpy()
+                        image_equal_hist_np = equalize_hist(image_np, nbins=cfg.tta.hist_bins)
+                        image = torch.from_numpy(image_equal_hist_np).to(image.device)[None][None]
 
-            if mask_paths is not None:
-                metrics = Evaluator().estimate_metrics(pred, mask, threshold=cfg.merging.threshold) # no post-processing
-                logger.info(f"Dice of {image_path.name.split('.')[0]}: {metrics['dice'].item()}")
-                logger.info(f"clDice of {image_path.name.split('.')[0]}: {metrics['cldice'].item()}")
-                metrics_dict[image_path.name.split('.')[0]] = metrics
+                    image_resampled = resample(image, factor=scale)
+                    logger.info(f'Running inference patch-wise | scale={scale}')
+                    logits = inferer(image_resampled, model)
+                    logits = resample(logits, target_shape=block_shape)
+                    preds.append(logits.cpu().squeeze())
+                    logger.info(f'Inference for scale={scale} completed')
 
-    if mask_paths is not None:
-        mean_metrics = calculate_mean_metrics(list(metrics_dict.values()), round_to=cfg.round_to)
-        logger.info(f"Mean metrics: dice {mean_metrics['dice'].item()}, cldice {mean_metrics['cldice'].item()}")
-    logger.info("Done.")
+                del image, image_resampled, logits
+                # merging
+                logger.info(f'Block {i} | Stacking scales')
+                if cfg.merging.max:
+                    pred = torch.stack(preds).max(dim=0)[0].sigmoid()
+                else:
+                    pred = torch.stack(preds).mean(dim=0).sigmoid()
+                pred_thresh = (pred > cfg.merging.threshold).numpy()
+                del pred
+
+                # post-processing
+                logger.info(f'Block {i} | Postprocessing')
+                if cfg.post.apply:
+                    pred_thresh = remove_small_objects(
+                        pred_thresh, min_size=cfg.post.small_objects_min_size,
+                        connectivity=cfg.post.small_objects_connectivity
+                    )
+
+                # save final pred
+                # sink = output_folder / f"{image_path.name.split('.')[0]}_{cfg.file_app}_pred.{file_ending}"
+                # save_writer.write_seg(pred_thresh.astype(np.uint8), sink)
+
+                sink_slicing = block.slicing
+                result_slicing = tuple(slice(None, min(ss, rs)) for ss, rs in zip(sink_shape, pred_thresh.shape[0:]))
+                sink_slicing = blkp.blk.slc.sliced_slicing(result_slicing, sink_slicing, sink_shape)
+                result_slicing = (0, 0) + result_slicing
+                sink[sink_slicing] = pred_thresh.astype(bool)
 
 
 if __name__ == "__main__":

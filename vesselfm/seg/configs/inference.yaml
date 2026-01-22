@@ -4,10 +4,10 @@ defaults:
   - _self_
 
 # i/o
-image_path: /path/to/image_folder #TODO
+image_path: path #TODO
 image_file_ending: nii.gz
-output_folder: /path/to/output_folder # TODO
-file_app: ""
+output_folder: path # TODO
+file_app: "vesselfm"
 
 mask_path: null
 round_to: 2
@@ -17,8 +17,8 @@ device: cuda:0
 ckpt_path: /path/to/ckpt.pt
 
 # sliding window inferer
-batch_size: 16
-patch_size: [128, 128, 128]
+batch_size: 6
+patch_size: [160, 160, 160] #[128, 128, 128]
 overlap: 0.5
 mode: "constant"
 sigma_scale: 0.125
@@ -42,7 +42,7 @@ transforms_config:
 
 # test time augmentation
 tta:
-  scales: [1] #[0.5, 1, 1.5]
+  scales: [1] #[0.5, 1, 1.5]  # WARNING superior to 1 to downsample
   invert: false
   invert_mean_thresh: 0.5
   equalize_hist: false
@@ -58,3 +58,8 @@ post:
 merging:
   threshold: 0.5
   max: false
+
+blocking:
+  axes: [0, 1, 2]
+  patch_to_block_ratio: 16
+  overlap: 50
