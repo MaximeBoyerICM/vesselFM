@@ -105,11 +105,13 @@ def main(cfg):
         sw_device='cuda', device='cpu', progress=True
     )
 
+
+    from utils.checkpoint import Checkpoint
     # loop over images
     with torch.no_grad():
-        # TODO
-        image_paths = [Path("/network/iss/renier/projects/vasculature/pregnancy/raw_buffer/250415_multipares_primipares_virgin_idisco/250415-3/3_arteries_stitched.npy")]
+        checkpoint = Checkpoint(output_folder / 'checkpoint.json', active=True)
         for idx, image_path in enumerate(image_paths):
+            image_name = image_path.name
             array = Array(image_path)
             source = cm_io.as_source(array.source)
             original_shape = source.shape
@@ -127,9 +129,22 @@ def main(cfg):
                                             axes=cfg.blocking.axes,
                                             size_max=block_size, size_min=block_size,
                                             overlap=cfg.blocking.overlap)
+
+            total_blocks = len(blocks)
+
+            if checkpoint.is_image_done(image_name, total_blocks):
+                logger.info(f'{image_name} already fully processed, skipping.')
+                continue
+
             logger.info(f'Splitted. Starting prediction.')
             for i, block in enumerate(blocks):
-                image = transforms(block.array)[None]
+
+                if checkpoint.is_block_done(image_name, i):
+                    logger.info(f'Block {i}/{total_blocks} already done, skipping.')
+                    continue
+
+                image = block.array.astype(np.float32)
+                image = transforms(image)[None]  # WARNING may be a bottleneck
                 image = image.to(dtype=torch.float32)
                 block_shape = image.shape
                 logger.info(f"Block {i}/{len(blocks)} - {image.shape}")
@@ -181,6 +196,9 @@ def main(cfg):
                 result_slicing = (0, 0) + result_slicing
                 sink[sink_slicing] = pred_thresh.astype(bool)
 
+                if hasattr(sink, 'flush'):
+                    sink.flush()
 
+                checkpoint.mark_block_done(image_name, i, total_blocks)
 if __name__ == "__main__":
     main()
