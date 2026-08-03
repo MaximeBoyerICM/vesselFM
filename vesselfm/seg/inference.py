@@ -24,6 +24,8 @@ import ClearMap.ParallelProcessing.BlockProcessing as blkp
 import ClearMap.ParallelProcessing.DataProcessing.ArrayProcessing as array_processing
 import ClearMap.IO.IO as cm_io
 
+from utils.checkpoint import Checkpoint
+
 warnings.filterwarnings("ignore")
 logger = logging.getLogger(__name__)
 
@@ -104,7 +106,6 @@ def main(cfg):
     )
 
 
-    from utils.checkpoint import Checkpoint
     # loop over images
     with torch.no_grad():
         # TODO
@@ -114,7 +115,7 @@ def main(cfg):
             image_name = image_path.name
             source = cm_io.as_source(image_path)
             original_shape = source.shape
-            logger.info(f'Processing {array.source.name} of shape: {original_shape}')
+            logger.info(f'Processing {image_name} of shape: {original_shape}')
 
             sink, sink_shape = array_processing.initialize_sink(sink=output_folder /
                                                                 f"{image_path.name.split('.')[0]}_{cfg.file_app}.npy",
