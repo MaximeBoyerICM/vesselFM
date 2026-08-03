@@ -18,8 +18,6 @@ from vesselfm.seg.utils.data import generate_transforms
 from vesselfm.seg.utils.io import determine_reader_writer
 from vesselfm.seg.utils.evaluation import Evaluator, calculate_mean_metrics
 
-from custom_array import Array
-
 path = os.path.join(os.path.expanduser("~"), "code", "ClearMap3")
 sys.path.insert(0, path)
 import ClearMap.ParallelProcessing.BlockProcessing as blkp
@@ -109,11 +107,12 @@ def main(cfg):
     from utils.checkpoint import Checkpoint
     # loop over images
     with torch.no_grad():
+        # TODO
+        image_paths = get_gbm_paths_by_config("/network/iss/renier/projects/human/gbm/processed/DeltaTissue/preprocessed_images/")
         checkpoint = Checkpoint(output_folder / 'checkpoint.json', active=True)
         for idx, image_path in enumerate(image_paths):
             image_name = image_path.name
-            array = Array(image_path)
-            source = cm_io.as_source(array.source)
+            source = cm_io.as_source(image_path)
             original_shape = source.shape
             logger.info(f'Processing {array.source.name} of shape: {original_shape}')
 
